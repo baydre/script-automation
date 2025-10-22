@@ -22,6 +22,7 @@ REPO_DIR=""
 CONTAINER_NAME="app_container_${RANDOM}"
 NGINX_SITE_NAME="dockerapp"
 CLEANUP_MODE=false
+SSH_PORT=22  # Default SSH port, can be overridden with --port option
 
 # Exit codes
 readonly EXIT_SUCCESS=0
@@ -116,9 +117,73 @@ validate_port() {
 validate_ssh_key() {
     local key_path="$1"
     if [ -f "$key_path" ] && [ -r "$key_path" ]; then
-        return 0
+        # Check if it's actually a private key
+        if grep -q "BEGIN .* PRIVATE KEY" "$key_path" 2>/dev/null; then
+            return 0
+        else
+            log_error "File exists but doesn't appear to be a valid private key"
+            return 1
+        fi
     fi
     return 1
+}
+
+# Function to diagnose common SSH issues
+diagnose_ssh_issues() {
+    log_info "=== Diagnosing SSH Connection Issues ==="
+    
+    # Check if key is in PEM format (common for AWS)
+    if ! grep -q "BEGIN RSA PRIVATE KEY" "${SSH_KEY_PATH}" 2>/dev/null; then
+        log_warn "SSH key may not be in expected PEM format for AWS EC2"
+    fi
+    
+    # Check for common username issues
+    case "${SSH_USER}" in
+        root)
+            log_warn "Using 'root' user - AWS EC2 typically uses 'ec2-user', 'ubuntu', or 'admin' instead"
+            ;;
+        admin)
+            log_info "Using 'admin' username - correct for Debian AMIs"
+            ;;
+        ubuntu)
+            log_info "Using 'ubuntu' username - correct for Ubuntu AMIs"
+            ;;
+        ec2-user)
+            log_info "Using 'ec2-user' username - correct for Amazon Linux AMIs"
+            ;;
+        *)
+            log_warn "Non-standard username '${SSH_USER}' - common EC2 usernames are 'ec2-user', 'ubuntu', or 'admin'"
+            ;;
+    esac
+    
+    # Check key file for Windows line endings
+    if grep -q $'\r' "${SSH_KEY_PATH}" 2>/dev/null; then
+        log_error "SSH key contains Windows-style line endings (CRLF)"
+        log_info "Fix by running: tr -d '\\r' < ${SSH_KEY_PATH} > ${SSH_KEY_PATH}.fixed && mv ${SSH_KEY_PATH}.fixed ${SSH_KEY_PATH}"
+    fi
+    
+    # Try a direct connection with netcat to check if SSH port is reachable
+    log_info "Testing if port ${SSH_PORT} is open on ${SERVER_IP}..."
+    if command -v nc &> /dev/null; then
+        if nc -zv -w 5 "${SERVER_IP}" ${SSH_PORT} >> "${LOG_FILE}" 2>&1; then
+            log_success "Port ${SSH_PORT} is open and accepting connections"
+        else
+            log_error "Port ${SSH_PORT} appears to be closed or blocked"
+            log_warn "Check EC2 security group rules to ensure SSH (port ${SSH_PORT}) is allowed"
+            if [ "${SSH_PORT}" != "22" ]; then
+                log_info "Using non-standard SSH port ${SSH_PORT} - verify this port is open in your security group"
+            fi
+        fi
+    else
+        log_warn "Netcat (nc) not available, skipping port check"
+    fi
+    
+    # AWS-specific advice
+    log_info "For AWS EC2 instances, verify the following:"
+    log_info "1. Instance is in 'running' state"
+    log_info "2. Security group allows inbound traffic on port ${SSH_PORT} from your IP"
+    log_info "3. Using the correct username for your AMI type (ec2-user, ubuntu, admin)"
+    log_info "4. The key pair associated with the instance matches your SSH key"
 }
 
 #############################################################################
@@ -194,6 +259,22 @@ collect_user_input() {
         fi
     done
     
+    # SSH Port (if not already specified via command line)
+    if [ "${SSH_PORT}" = "22" ]; then
+        read -p "Enter SSH port [default: 22]: " SSH_PORT_INPUT
+        if [ -n "$SSH_PORT_INPUT" ]; then
+            if validate_port "$SSH_PORT_INPUT"; then
+                SSH_PORT=$SSH_PORT_INPUT
+                log_info "SSH port set to: ${SSH_PORT}"
+            else
+                log_warn "Invalid SSH port, using default: 22"
+                SSH_PORT=22
+            fi
+        fi
+    else
+        log_info "Using SSH port ${SSH_PORT} (from command line)"
+    fi
+    
     log_success "All parameters collected successfully"
 }
 
@@ -263,22 +344,84 @@ test_ssh_connection() {
         log_warn "Server not responding to ping (might be blocked)"
     fi
     
-    # Test SSH connection
-    if ssh -i "${SSH_KEY_PATH}" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-        "${SSH_USER}@${SERVER_IP}" "echo 'SSH connection successful'" >> "${LOG_FILE}" 2>&1; then
+    # Check SSH key permissions
+    local key_permissions=$(stat -c "%a" "${SSH_KEY_PATH}")
+    if [ "${key_permissions}" != "400" ] && [ "${key_permissions}" != "600" ]; then
+        log_warn "SSH key permissions are ${key_permissions}, should be 400 or 600. Fixing..."
+        chmod 400 "${SSH_KEY_PATH}"
+        log_info "SSH key permissions set to 400"
+    fi
+    
+    # Print SSH command for debugging
+    log_info "Attempting SSH connection with: ssh -i \"${SSH_KEY_PATH}\" -p ${SSH_PORT} -o StrictHostKeyChecking=no -o ConnectTimeout=10 \"${SSH_USER}@${SERVER_IP}\""
+    
+    # Test SSH connection with verbose output
+    log_info "Running verbose SSH test (see log file for details)"
+    ssh -vvv -i "${SSH_KEY_PATH}" -p ${SSH_PORT} -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+        "${SSH_USER}@${SERVER_IP}" "echo 'SSH connection successful'" >> "${LOG_FILE}" 2>&1
+    
+    local ssh_exit_code=$?
+    if [ ${ssh_exit_code} -eq 0 ]; then
         log_success "SSH connection established successfully"
     else
-        error_exit "Failed to establish SSH connection" ${EXIT_SSH_ERROR}
+        log_error "SSH connection failed with exit code: ${ssh_exit_code}"
+        log_error "Check ${LOG_FILE} for detailed SSH debugging information"
+        
+        # Additional diagnostics
+        log_info "=== SSH Diagnostics ==="
+        log_info "Server: ${SERVER_IP}, Username: ${SSH_USER}, Key: ${SSH_KEY_PATH}"
+        log_info "Checking known_hosts issues..."
+        
+        # Check if host key might be causing issues
+        if grep -q "${SERVER_IP}" ~/.ssh/known_hosts 2>/dev/null; then
+            log_warn "Host key exists in known_hosts, might need to be updated"
+            log_info "Try manually: ssh-keygen -R ${SERVER_IP}"
+        fi
+        
+        # Run comprehensive diagnostics
+        diagnose_ssh_issues
+        
+        # AWS-specific advice
+        log_info "For AWS EC2 instances, check security group inbound rules"
+        log_info "Ensure port 22 is open for your IP address or 0.0.0.0/0"
+        log_info "Also verify that the instance is running"
+        
+        error_exit "Failed to establish SSH connection. See log file for details." ${EXIT_SSH_ERROR}
     fi
 }
 
 execute_remote_command() {
     local command="$1"
     local error_message="${2:-Remote command failed}"
+    local retry_count=0
+    local max_retries=3
+    local success=false
     
-    ssh -i "${SSH_KEY_PATH}" -o StrictHostKeyChecking=no \
-        "${SSH_USER}@${SERVER_IP}" "${command}" >> "${LOG_FILE}" 2>&1 || \
+    log_info "Executing remote command: ${command}"
+    
+    # Add retry mechanism for transient SSH issues
+    while [ ${retry_count} -lt ${max_retries} ] && [ "$success" = false ]; do
+        if [ ${retry_count} -gt 0 ]; then
+            log_warn "Retrying command (attempt ${retry_count}/${max_retries})..."
+            sleep 3
+        fi
+        
+        # Execute the command with a timeout
+        ssh -i "${SSH_KEY_PATH}" -p ${SSH_PORT} -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+            "${SSH_USER}@${SERVER_IP}" "${command}" >> "${LOG_FILE}" 2>&1
+            
+        if [ $? -eq 0 ]; then
+            success=true
+            break
+        fi
+        
+        retry_count=$((retry_count+1))
+    done
+    
+    if [ "$success" = false ]; then
+        log_error "Command failed after ${max_retries} attempts: ${command}"
         error_exit "${error_message}" ${EXIT_SSH_ERROR}
+    fi
 }
 
 #############################################################################
@@ -326,7 +469,7 @@ transfer_files() {
     execute_remote_command "mkdir -p ${remote_dir}" "Failed to create remote directory"
     
     log_info "Transferring files via rsync..."
-    rsync -avz --progress -e "ssh -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=no" \
+    rsync -avz --progress -e "ssh -i ${SSH_KEY_PATH} -p ${SSH_PORT} -o StrictHostKeyChecking=no" \
         "${REPO_DIR}/" "${SSH_USER}@${SERVER_IP}:${remote_dir}/" >> "${LOG_FILE}" 2>&1 || \
         error_exit "Failed to transfer files" ${EXIT_SSH_ERROR}
     
@@ -357,7 +500,7 @@ deploy_docker_application() {
             "cd ${REMOTE_APP_DIR} && docker-compose up -d --build" \
             "Docker Compose deployment failed"
         
-        CONTAINER_NAME=$(ssh -i "${SSH_KEY_PATH}" -o StrictHostKeyChecking=no \
+        CONTAINER_NAME=$(ssh -i "${SSH_KEY_PATH}" -p ${SSH_PORT} -o StrictHostKeyChecking=no \
             "${SSH_USER}@${SERVER_IP}" \
             "cd ${REMOTE_APP_DIR} && docker-compose ps -q | head -n1 | xargs docker inspect --format='{{.Name}}' | sed 's/\///'" 2>/dev/null || echo "compose_app")
     else
@@ -415,7 +558,7 @@ server {
 EOF
     
     log_info "Uploading Nginx configuration..."
-    scp -i "${SSH_KEY_PATH}" -o StrictHostKeyChecking=no \
+    scp -i "${SSH_KEY_PATH}" -P ${SSH_PORT} -o StrictHostKeyChecking=no \
         "${TEMP_DIR}/nginx_config" \
         "${SSH_USER}@${SERVER_IP}:/tmp/nginx_config" >> "${LOG_FILE}" 2>&1 || \
         error_exit "Failed to upload Nginx config" ${EXIT_NGINX_ERROR}
@@ -544,7 +687,7 @@ print_summary() {
     log_info "=== Deployment Summary ==="
     log_info "Repository: ${GIT_REPO_URL}"
     log_info "Branch: ${GIT_BRANCH}"
-    log_info "Remote Server: ${SSH_USER}@${SERVER_IP}"
+    log_info "Remote Server: ${SSH_USER}@${SERVER_IP}:${SSH_PORT}"
     log_info "Application Port: ${APP_PORT}"
     log_info "Container Name: ${CONTAINER_NAME}"
     log_info "Access URL: http://${SERVER_IP}"
@@ -556,10 +699,39 @@ main() {
     print_banner
     log_info "Deployment started at $(date)"
     
+    # Process command line arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --cleanup)
+                CLEANUP_MODE=true
+                log_info "Running in CLEANUP mode"
+                shift
+                ;;
+            --port)
+                if [[ -n "$2" && "$2" =~ ^[0-9]+$ ]]; then
+                    SSH_PORT="$2"
+                    log_info "Using custom SSH port: ${SSH_PORT}"
+                    shift 2
+                else
+                    error_exit "Port number is required after --port" ${EXIT_INVALID_INPUT}
+                fi
+                ;;
+            --help)
+                echo "Usage: $0 [options]"
+                echo "Options:"
+                echo "  --cleanup        Remove all deployed resources"
+                echo "  --port NUMBER    Use custom SSH port (default: 22)"
+                echo "  --help           Show this help message"
+                exit ${EXIT_SUCCESS}
+                ;;
+            *)
+                error_exit "Unknown option: $1" ${EXIT_INVALID_INPUT}
+                ;;
+        esac
+    done
+    
     # Check for cleanup flag
-    if [ "${1:-}" = "--cleanup" ]; then
-        CLEANUP_MODE=true
-        log_info "Running in CLEANUP mode"
+    if [ "${CLEANUP_MODE}" = true ]; then
         collect_user_input
         test_ssh_connection
         cleanup_deployment
